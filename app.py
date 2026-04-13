@@ -416,17 +416,14 @@ def _build_summary_stats(client_df):
         if s not in staff_order:
             staff_order.append(s)
 
-    # Shared denominator: total distinct dates across the whole client sheet
-    total_dates = client_df["[Time] Date"].dropna().nunique() or 1
-
-    rows = []
+   rows = []
     for staff in staff_order:
-        sd = client_df[client_df["[Staff] Name"] == staff]
-        bill  = round(sd[sd["[Time] Billable"].str.strip().str.lower() == "yes"]["Sum of [Time] Time (Totalled)"].sum(), 2)
-        nbill = round(sd[sd["[Time] Billable"].str.strip().str.lower() == "no"]["Sum of [Time] Time (Totalled)"].sum(), 2)
-        bill_pd  = round(bill  / total_dates, 2)
-        nbill_pd = round(nbill / total_dates, 2)
-        rows.append((staff, bill, bill_pd, nbill, nbill_pd))
+    sd = client_df[client_df["[Staff] Name"] == staff]
+    bill  = round(sd[sd["[Time] Billable"].str.strip().str.lower() == "yes"]["Sum of [Time] Time (Totalled)"].sum(), 2)
+    nbill = round(sd[sd["[Time] Billable"].str.strip().str.lower() == "no"]["Sum of [Time] Time (Totalled)"].sum(), 2)
+    bill_pd  = round(bill  / 8, 2)
+    nbill_pd = round(nbill / 8, 2)
+    rows.append((staff, bill, bill_pd, nbill, nbill_pd))
     return rows
 
 
