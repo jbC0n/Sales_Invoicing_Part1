@@ -403,29 +403,21 @@ def build_pivot(df):
 HEADER_COLOR = "CCE5FF"
 YELLOW_COLOR = "FFFF00"
 
-
 def _build_summary_stats(client_df):
-    """Build per-staff billable/non-billable summary stats for a client sheet.
-
-    Total Per Day uses the count of distinct dates across ALL staff in the sheet
-    as the shared denominator (matching the sample output behaviour).
-    """
-    # Unique staff in pivot order (preserving first-appearance order)
     staff_order = []
     for s in client_df["[Staff] Name"]:
         if s not in staff_order:
             staff_order.append(s)
 
-   rows = []
+    rows = []
     for staff in staff_order:
-    sd = client_df[client_df["[Staff] Name"] == staff]
-    bill  = round(sd[sd["[Time] Billable"].str.strip().str.lower() == "yes"]["Sum of [Time] Time (Totalled)"].sum(), 2)
-    nbill = round(sd[sd["[Time] Billable"].str.strip().str.lower() == "no"]["Sum of [Time] Time (Totalled)"].sum(), 2)
-    bill_pd  = round(bill  / 8, 2)
-    nbill_pd = round(nbill / 8, 2)
-    rows.append((staff, bill, bill_pd, nbill, nbill_pd))
+        sd = client_df[client_df["[Staff] Name"] == staff]
+        bill  = round(sd[sd["[Time] Billable"].str.strip().str.lower() == "yes"]["Sum of [Time] Time (Totalled)"].sum(), 2)
+        nbill = round(sd[sd["[Time] Billable"].str.strip().str.lower() == "no"]["Sum of [Time] Time (Totalled)"].sum(), 2)
+        bill_pd  = round(bill  / 8, 2)
+        nbill_pd = round(nbill / 8, 2)
+        rows.append((staff, bill, bill_pd, nbill, nbill_pd))
     return rows
-
 
 def write_client_sheet(ws, client_name, client_df):
     ws.append([])
