@@ -313,8 +313,65 @@ def load_workbook_data(uploaded_file):
     cm_df.columns = ["Client","CM","Batch"]
     for c in ["Client","CM","Batch"]:
         cm_df[c] = cm_df[c].astype(str).str.strip()
+
+    # Read 'List of client FF and SD' sheet for Part 3 (FF/NFF split)
+    status_df = pd.DataFrame(columns=["Client","Status"])
+    status_sheet_info = {"found": False, "sheet_name": None, "columns": [], "raw_rows": 0}
+    
+    # Try exact name first, then case-insensitive match
+    target_sheet = None
+    for sname in wb.sheetnames:
+        if sname == "List of client FF and SD":
+            target_sheet = sname
+            break
+    if not target_sheet:
+        for sname in wb.sheetnames:
+            if "ff" in sname.lower() and ("sd" in sname.lower() or "nff" in sname.lower() or "list" in sname.lower()):
+                target_sheet = sname
+                break
+
+    if target_sheet:
+        status_sheet_info["found"] = True
+        status_sheet_info["sheet_name"] = target_sheet
+        ws_st = wb[target_sheet]
+        # Read ALL rows (don't break on blank - blank rows may exist mid-sheet)
+        all_rows = list(ws_st.iter_rows(values_only=True))
+        # Drop fully-None rows
+        all_rows = [r for r in all_rows if any(v is not None for v in r)]
+        status_sheet_info["raw_rows"] = len(all_rows)
+
+        if len(all_rows) > 1:
+            headers = [str(h) if h is not None else f"col_{i}" for i, h in enumerate(all_rows[0])]
+            status_sheet_info["columns"] = headers
+            st_df_raw = pd.DataFrame(all_rows[1:], columns=headers)
+
+            # Find Client column: first non-empty column (col A = index 0)
+            client_col = headers[0] if headers else None
+
+            # Find Status column: look for header containing "status" (case-insensitive),
+            # fall back to column H (index 7)
+            status_col = None
+            for h in headers:
+                if "status" in h.lower():
+                    status_col = h
+                    break
+            if not status_col and len(headers) > 7:
+                status_col = headers[7]
+
+            status_sheet_info["client_col"] = client_col
+            status_sheet_info["status_col"] = status_col
+
+            if client_col and status_col:
+                status_df = st_df_raw[[client_col, status_col]].copy()
+                status_df.columns = ["Client", "Status"]
+                # Strip regular AND non-breaking spaces (\xa0) from both columns
+                status_df["Client"] = status_df["Client"].astype(str).str.strip().str.replace('\xa0', '', regex=False).str.strip()
+                status_df["Status"] = status_df["Status"].astype(str).str.strip().str.replace('\xa0', '', regex=False).str.strip()
+                # Drop rows with no client name
+                status_df = status_df[~status_df["Client"].isin(["", "nan", "None"])]
+
     wb.close()
-    return xpm_df, cm_df
+    return xpm_df, cm_df, status_df, status_sheet_info
 
 
 def apply_three_range_filter(xpm_df, cm_df, main_start, main_end, weekly_start, weekly_end, monthly_start, monthly_end):
@@ -347,12 +404,38 @@ HEADER_COLOR = "CCE5FF"
 YELLOW_COLOR = "FFFF00"
 
 
+def _build_summary_stats(client_df):
+    """Build per-staff billable/non-billable summary stats for a client sheet.
+
+    Total Per Day uses the count of distinct dates across ALL staff in the sheet
+    as the shared denominator (matching the sample output behaviour).
+    """
+    # Unique staff in pivot order (preserving first-appearance order)
+    staff_order = []
+    for s in client_df["[Staff] Name"]:
+        if s not in staff_order:
+            staff_order.append(s)
+
+    # Shared denominator: total distinct dates across the whole client sheet
+    total_dates = client_df["[Time] Date"].dropna().nunique() or 1
+
+    rows = []
+    for staff in staff_order:
+        sd = client_df[client_df["[Staff] Name"] == staff]
+        bill  = round(sd[sd["[Time] Billable"].str.strip().str.lower() == "yes"]["Sum of [Time] Time (Totalled)"].sum(), 2)
+        nbill = round(sd[sd["[Time] Billable"].str.strip().str.lower() == "no"]["Sum of [Time] Time (Totalled)"].sum(), 2)
+        bill_pd  = round(bill  / total_dates, 2)
+        nbill_pd = round(nbill / total_dates, 2)
+        rows.append((staff, bill, bill_pd, nbill, nbill_pd))
+    return rows
+
+
 def write_client_sheet(ws, client_name, client_df):
     ws.append([])
     ws.append([])
     headers = ["Row Labels","[Staff] Name","[Time] Date","[Job] Name","[Time] Note","[Time] Billable","Sum of [Time] Time (Totalled)"]
     ws.append(headers)
-    hdr_row  = ws.max_row
+    hdr_row  = ws.max_row  # row 3
     hdr_fill = PatternFill("solid", fgColor=HEADER_COLOR)
     hdr_font = Font(bold=True, name="Arial")
     for col_idx in range(1, len(headers) + 1):
@@ -360,9 +443,36 @@ def write_client_sheet(ws, client_name, client_df):
         cell.fill = hdr_fill
         cell.font = hdr_font
 
+    # ── Part 2: Summary table headers at row 3 (J3 & O3) ──────────────────
+    # BILLABLE label at J3 (col 10), NON-BILLABLE label at O3 (col 15)
+    ws.cell(row=3, column=10).value = "BILLABLE HOURS SUMMARY"
+    ws.cell(row=3, column=15).value = "NON-BILLABLE HOURS SUMMARY"
+    for col in (10, 15):
+        ws.cell(row=3, column=col).font = Font(bold=True, name="Arial")
+
+    # Column headers at row 4: J=Staff Name, K=Billable, L=Total HRS, M=Total Per Day
+    #                          O=Staff Name, P=Billable, Q=Total HRS, R=Total Per Day
+    SUM_HDR_FILL = PatternFill("solid", fgColor="CCE5FF")
+    sum_hdr_font = Font(bold=True, name="Arial")
+    for start_col, label in [(10, "Billable"), (15, "Non-Billable")]:
+        for ci, txt in enumerate(["Staff Name", label, "Total HRS", "Total Per Day"], start=start_col):
+            c = ws.cell(row=4, column=ci)
+            c.value = "Yes" if txt == "Billable" else ("No" if txt == "Non-Billable" else txt)
+            # Restore actual header text
+        ws.cell(row=4, column=start_col).value = "Staff Name"
+        ws.cell(row=4, column=start_col+1).value = "Billable"
+        ws.cell(row=4, column=start_col+2).value = "Total HRS"
+        ws.cell(row=4, column=start_col+3).value = "Total Per Day"
+        for ci in range(start_col, start_col+4):
+            c = ws.cell(row=4, column=ci)
+            c.fill = SUM_HDR_FILL
+            c.font = sum_hdr_font
+
+    # Pre-compute summary stats (needed to write alongside data rows)
+    summary_stats = _build_summary_stats(client_df)
+
     prev_client = prev_staff = prev_date = prev_job = None
     yellow_fill = PatternFill("solid", fgColor=YELLOW_COLOR)
-    normal_font = Font(name="Arial")
 
     for _, row in client_df.iterrows():
         cv, sv, dv, jv = row["[Job] Client"], row["[Staff] Name"], row["[Time] Date"], row["[Job] Name"]
@@ -391,65 +501,158 @@ def write_client_sheet(ws, client_name, client_df):
         cell.fill = PatternFill("solid", fgColor=HEADER_COLOR)
         cell.font = Font(bold=True, name="Arial")
 
+    # ── Part 2: Write summary data rows starting at row 5 ──────────────────
+    for i, (staff, bill, bill_pd, nbill, nbill_pd) in enumerate(summary_stats):
+        data_row = 5 + i
+        # Billable table (cols J-M = 10-13)
+        ws.cell(data_row, 10).value = staff
+        ws.cell(data_row, 11).value = "Yes"
+        ws.cell(data_row, 12).value = bill
+        ws.cell(data_row, 13).value = bill_pd
+        for ci in range(10, 14):
+            ws.cell(data_row, ci).font = Font(name="Arial")
+        # Non-billable table (cols O-R = 15-18)
+        ws.cell(data_row, 15).value = staff
+        ws.cell(data_row, 16).value = "No"
+        ws.cell(data_row, 17).value = nbill
+        ws.cell(data_row, 18).value = nbill_pd
+        for ci in range(15, 19):
+            ws.cell(data_row, ci).font = Font(name="Arial")
+
+    # Auto-fit columns (skip note col 5; summary cols set fixed width)
     for ci, col_cells in enumerate(ws.columns, start=1):
         if ci == 5: continue
+        if ci in (9, 14): continue  # gap columns
         max_len = max((len(str(c.value)) for c in col_cells if c.value), default=10)
         ws.column_dimensions[get_column_letter(ci)].width = min(max_len + 4, 50)
 
 
-def generate_cm_workbooks(pivot_df, cm_df, main_end_date):
+def _safe_sheet_name(name):
+    sn = name[:31]
+    for ch in r'/\\?*[]:\':\' ': sn = sn.replace(ch, " ")
+    return sn
+
+
+def generate_all_cm_files(pivot_df, cm_df, status_df, main_end_date):
+    """Generate all output files per CM:
+    - {CM} {date}.xlsx          — all clients (combined)
+    - {CM} {date} FF.xlsx       — Approve & Sent clients only
+    - {CM} {date} NFF.xlsx      — Saved as Draft clients only
+
+    Returns:
+        cm_data        : {cm: {"combined": (fname, bytes), "FF": (fname, bytes), "NFF": (fname, bytes)}}
+        unassigned     : set of client names with no CM mapping
+        unassigned_bytes : bytes of Unassigned Clients.xlsx (or None)
+        status_warnings  : list of warning strings
+    """
     end_str = main_end_date.strftime("%d.%m.%y")
+    all_clients = set(pivot_df["[Job] Client"].dropna().unique())
+
+    # ── client → FF/NFF status ──────────────────────────────────────────────
+    client_status = {}
+    status_warnings = []
+    # Accept both spellings ("Approve & Sent" and "Approved & Sent")
+    valid_statuses = {
+        "approve & sent":  "FF",
+        "approved & sent": "FF",
+        "saved as draft":  "NFF",
+    }
+    for _, row in status_df.iterrows():
+        client = str(row["Client"]).replace('\xa0', '').strip()
+        status = str(row["Status"]).replace('\xa0', '').strip()
+        if client in ("", "nan", "None"): continue
+        s_lower = status.lower()
+        if s_lower in valid_statuses:
+            client_status[client] = valid_statuses[s_lower]
+        elif s_lower not in ("", "nan", "none"):
+            status_warnings.append(f"Unrecognized status \"{status}\" for client \"{client}\"")
+
+    # ── client → CM mapping ────────────────────────────────────────────────
     client_cm_map = dict(zip(cm_df["Client"], cm_df["CM"]))
-    all_clients   = set(pivot_df["[Job] Client"].dropna().unique())
-    unassigned    = {c for c in all_clients if client_cm_map.get(c, "") in ("","nan","None")}
+    unassigned = {c for c in all_clients if client_cm_map.get(c, "") in ("", "nan", "None")}
 
-    cm_clients = {}
+    # ── build per-CM client lists ──────────────────────────────────────────
+    cm_clients_all = {}   # {cm: [all clients]}
+    cm_clients_ff  = {}   # {cm: [FF clients]}
+    cm_clients_nff = {}   # {cm: [NFF clients]}
+
     for _, row in cm_df.iterrows():
-        cm, client = row["CM"], row["Client"]
-        if cm in ("","nan","None") or pd.isnull(cm): continue
+        cm, client = str(row["CM"]).strip(), str(row["Client"]).strip()
+        if cm in ("", "nan", "None") or not cm: continue
         if client not in all_clients: continue
-        cm_clients.setdefault(cm, []).append(client)
+        cm_clients_all.setdefault(cm, []).append(client)
+        ftype = client_status.get(client)
+        if ftype == "FF":
+            cm_clients_ff.setdefault(cm, []).append(client)
+        elif ftype == "NFF":
+            cm_clients_nff.setdefault(cm, []).append(client)
+        elif ftype is None and client not in unassigned:
+            status_warnings.append(f"No status found for client \"{client}\" (CM: {cm})")
 
-    cm_workbooks = {}
-    for cm, clients in cm_clients.items():
+    # ── helper: build one workbook from a client list ──────────────────────
+    def _make_wb(clients):
         wb = openpyxl.Workbook()
         wb.remove(wb.active)
         for client in clients:
             cd = pivot_df[pivot_df["[Job] Client"] == client].copy()
             if cd["Sum of [Time] Time (Totalled)"].sum() == 0: continue
-            sn = client[:31]
-            for ch in r'/\\?*[]:\':\' ': sn = sn.replace(ch, " ")
-            ws = wb.create_sheet(title=sn)
+            ws = wb.create_sheet(title=_safe_sheet_name(client))
             write_client_sheet(ws, client, cd)
-        if not wb.sheetnames: continue
+        if not wb.sheetnames:
+            return None
         buf = io.BytesIO()
         wb.save(buf)
-        cm_workbooks[cm] = (f"{cm} {end_str}.xlsx", buf.getvalue())
+        return buf.getvalue()
 
+    # ── build per-CM output dict ───────────────────────────────────────────
+    cm_data = {}
+    all_cms = sorted(set(list(cm_clients_all.keys())))
+    for cm in all_cms:
+        entry = {}
+        # Combined
+        combined_bytes = _make_wb(cm_clients_all.get(cm, []))
+        if combined_bytes:
+            entry["combined"] = (f"{cm} {end_str}.xlsx", combined_bytes)
+        # FF
+        ff_bytes = _make_wb(cm_clients_ff.get(cm, []))
+        if ff_bytes:
+            entry["FF"] = (f"{cm} {end_str} FF.xlsx", ff_bytes)
+        # NFF
+        nff_bytes = _make_wb(cm_clients_nff.get(cm, []))
+        if nff_bytes:
+            entry["NFF"] = (f"{cm} {end_str} NFF.xlsx", nff_bytes)
+        if entry:
+            cm_data[cm] = entry
+
+    # ── unassigned clients workbook ────────────────────────────────────────
     unassigned_bytes = None
     if unassigned:
-        wb_u = openpyxl.Workbook(); wb_u.remove(wb_u.active)
-        for client in sorted(unassigned):
-            cd = pivot_df[pivot_df["[Job] Client"] == client].copy()
-            if cd.empty: continue
-            sn = client[:31]
-            for ch in r'/\\?*[]:\':\' ': sn = sn.replace(ch, " ")
-            ws = wb_u.create_sheet(title=sn)
-            write_client_sheet(ws, client, cd)
-        if wb_u.sheetnames:
-            buf_u = io.BytesIO(); wb_u.save(buf_u)
-            unassigned_bytes = buf_u.getvalue()
+        ub = _make_wb(sorted(unassigned))
+        if ub:
+            unassigned_bytes = ub
 
-    return cm_workbooks, unassigned, unassigned_bytes
+    return cm_data, unassigned, unassigned_bytes, status_warnings
 
 
-def build_zip(cm_workbooks, unassigned_bytes):
+def build_master_zip(cm_data, unassigned_bytes):
+    """One ZIP with a folder per CM containing combined + FF + NFF files."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for cm, (filename, wb_bytes) in cm_workbooks.items():
-            zf.writestr(f"{cm}/{filename}", wb_bytes)
+        for cm, entry in cm_data.items():
+            for key, (filename, wb_bytes) in entry.items():
+                zf.writestr(f"{cm}/{filename}", wb_bytes)
         if unassigned_bytes:
             zf.writestr("Unassigned Clients.xlsx", unassigned_bytes)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def build_cm_zip(cm, entry):
+    """ZIP for a single CM containing all their files."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for key, (filename, wb_bytes) in entry.items():
+            zf.writestr(filename, wb_bytes)
     buf.seek(0)
     return buf.getvalue()
 
@@ -464,7 +667,7 @@ with col_side:
     <div class="step-card">
         <div class="step-badge">Step 01</div>
         <h3>Upload Workbook</h3>
-        <p>Your master <code>.xlsm</code> or <code>.xlsx</code> file with <em>XPM Data</em> and <em>CM assignment</em> sheets.</p>
+        <p>Master <code>.xlsm</code> or <code>.xlsx</code> with <em>XPM Data</em>, <em>CM assignment</em>, and <em>List of client FF and SD</em> sheets.</p>
     </div>
     <div class="step-card">
         <div class="step-badge">Step 02</div>
@@ -474,7 +677,7 @@ with col_side:
     <div class="step-card">
         <div class="step-badge">Step 03</div>
         <h3>Generate & Download</h3>
-        <p>Click Run. Download per-CM workbooks individually or as a single ZIP.</p>
+        <p>Click Run. Download combined workbooks, or split FF / NFF files per CM — each with billable summary tables.</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -491,13 +694,37 @@ with col_main:
     if uploaded:
         with st.spinner("Reading workbook…"):
             try:
-                xpm_df, cm_df = load_workbook_data(uploaded)
+                xpm_df, cm_df, status_df, status_sheet_info = load_workbook_data(uploaded)
                 st.markdown(f'''
                 <div class="alert-success">
                     ✓ &nbsp;<strong>File loaded</strong> &nbsp;·&nbsp;
                     {len(xpm_df):,} XPM rows &nbsp;·&nbsp;
                     {len(cm_df):,} clients in CM list
                 </div>''', unsafe_allow_html=True)
+
+                # ── Status sheet debug info ───────────────────────────────
+                if status_sheet_info["found"]:
+                    n_ff  = status_df["Status"].str.replace('\xa0', '', regex=False).str.strip().str.lower().isin(["approve & sent", "approved & sent"]).sum()
+                    n_nff = status_df["Status"].str.replace('\xa0', '', regex=False).str.strip().str.lower().eq("saved as draft").sum()
+                    n_other = len(status_df) - n_ff - n_nff
+                    st.markdown(f'''
+                    <div class="alert-success">
+                        ✓ &nbsp;<strong>Status sheet found:</strong> "{status_sheet_info["sheet_name"]}"
+                        &nbsp;·&nbsp; {len(status_df)} clients
+                        &nbsp;·&nbsp; {n_ff} FF (Approve &amp; Sent)
+                        &nbsp;·&nbsp; {n_nff} NFF (Saved as Draft)
+                        {f'&nbsp;·&nbsp; <span style="color:#ffb400">{n_other} unrecognised</span>' if n_other else ''}
+                    </div>''', unsafe_allow_html=True)
+                    with st.expander("🔍 Inspect status sheet data"):
+                        st.caption(f"Sheet: **{status_sheet_info['sheet_name']}** · Columns found: {status_sheet_info.get('columns', [])} · Client col: **{status_sheet_info.get('client_col')}** · Status col: **{status_sheet_info.get('status_col')}**")
+                        st.dataframe(status_df, use_container_width=True, height=200)
+                else:
+                    st.markdown('''
+                    <div class="alert-warning">
+                        ⚠ &nbsp;<strong>No status sheet found</strong> — FF/NFF files will not be generated.
+                        Add a sheet named <em>"List of client FF and SD"</em> with client names in column A
+                        and status values (<em>Approve &amp; Sent</em> or <em>Saved as Draft</em>) in column H.
+                    </div>''', unsafe_allow_html=True)
             except Exception as e:
                 st.markdown(f'<div class="alert-error">✕ {e}</div>', unsafe_allow_html=True)
                 st.stop()
@@ -548,13 +775,17 @@ with col_main:
                 st.markdown('<div class="alert-warning">⚠ No records matched the given date ranges. Check your dates and try again.</div>', unsafe_allow_html=True)
                 st.stop()
 
-            with st.spinner("Building CM workbooks…"):
-                cm_workbooks, unassigned_clients, unassigned_bytes = generate_cm_workbooks(pivot_df, cm_df, main_end)
+            with st.spinner("Building workbooks…"):
+                cm_data, unassigned_clients, unassigned_bytes, status_warnings = generate_all_cm_files(
+                    pivot_df, cm_df, status_df, main_end
+                )
 
             # Metrics
+            has_ff  = any("FF"  in e for e in cm_data.values())
+            has_nff = any("NFF" in e for e in cm_data.values())
             metrics = [
                 (f"{len(filtered_df):,}", "Filtered Rows"),
-                (str(len(cm_workbooks)),  "CM Workbooks"),
+                (str(len(cm_data)),       "CMs"),
                 (f"{pivot_df['Sum of [Time] Time (Totalled)'].sum():.1f}", "Total Hours"),
                 (str(len(unassigned_clients)), "Unassigned"),
             ]
@@ -567,35 +798,47 @@ with col_main:
                     </div>''', unsafe_allow_html=True)
 
             st.markdown('<div class="grad-divider"></div>', unsafe_allow_html=True)
-            st.markdown('<div class="section-label">⬇ Downloads</div>', unsafe_allow_html=True)
 
-            if cm_workbooks:
-                zip_bytes = build_zip(cm_workbooks, unassigned_bytes)
+            # ── Master ZIP (all CMs, all files) ───────────────────────────
+            if cm_data:
+                master_zip = build_master_zip(cm_data, unassigned_bytes)
                 st.download_button(
-                    label="📦  Download ALL as ZIP",
-                    data=zip_bytes,
+                    label="📦  Download ALL — one ZIP with a folder per CM",
+                    data=master_zip,
                     file_name=f"Invoicing_{main_end.strftime('%d.%m.%y')}.zip",
                     mime="application/zip",
                     use_container_width=True,
                     type="primary",
+                    key="dl_master_zip",
                 )
 
-            st.markdown('<div class="dl-section-label">— or download per CM —</div>', unsafe_allow_html=True)
+            # ── Per-CM download section ───────────────────────────────────
+            st.markdown('<div class="section-label" style="margin-top:1.2rem">⬇ Download per CM</div>', unsafe_allow_html=True)
+            st.markdown('<div class="dl-section-label">Each button downloads a ZIP with the combined, FF, and NFF files for that CM</div>', unsafe_allow_html=True)
 
-            cm_list = sorted(cm_workbooks.items())
+            cm_list = sorted(cm_data.items())
             for i in range(0, len(cm_list), 3):
                 cols = st.columns(3)
-                for j, (cm, (filename, wb_bytes)) in enumerate(cm_list[i:i+3]):
+                for j, (cm, entry) in enumerate(cm_list[i:i+3]):
                     with cols[j]:
+                        cm_zip_bytes = build_cm_zip(cm, entry)
+                        # Build label showing which files are inside
+                        file_types = []
+                        if "combined" in entry: file_types.append("Combined")
+                        if "FF"       in entry: file_types.append("FF")
+                        if "NFF"      in entry: file_types.append("NFF")
+                        tag = " · ".join(file_types)
                         st.download_button(
                             label=f"👤  {cm}",
-                            data=wb_bytes,
-                            file_name=filename,
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            help=f"Contains: {tag}",
+                            data=cm_zip_bytes,
+                            file_name=f"{cm} {main_end.strftime('%d.%m.%y')}.zip",
+                            mime="application/zip",
                             use_container_width=True,
-                            key=f"dl_{cm}",
+                            key=f"dl_cm_{cm}",
                         )
 
+            # ── Unassigned clients ────────────────────────────────────────
             if unassigned_bytes:
                 st.markdown('<div class="grad-divider"></div>', unsafe_allow_html=True)
                 names = ", ".join(sorted(unassigned_clients)[:8])
@@ -607,7 +850,19 @@ with col_main:
                     file_name="Unassigned Clients.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
+                    key="dl_unassigned",
                 )
+
+            # ── FF/NFF status info ────────────────────────────────────────
+            if not has_ff and not has_nff:
+                st.markdown('<div class="grad-divider"></div>', unsafe_allow_html=True)
+                st.markdown('<div class="alert-warning">ℹ FF and NFF files were not generated — ensure the master workbook includes a "List of client FF and SD" sheet with an "Approve &amp; Sent" or "Saved as Draft" value in column H for each client.</div>', unsafe_allow_html=True)
+
+            # ── Status warnings ───────────────────────────────────────────
+            if status_warnings:
+                st.markdown('<div class="grad-divider"></div>', unsafe_allow_html=True)
+                for w in status_warnings:
+                    st.markdown(f'<div class="alert-warning">⚠ {w}</div>', unsafe_allow_html=True)
     else:
         st.markdown('''<div class="upload-prompt">
             <div class="icon">↑</div>
